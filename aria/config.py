@@ -10,7 +10,7 @@ class ConfigurationError(ValueError):
     """A required setting is missing or invalid."""
 
 
-LOCAL_SETTINGS = {"ARIA_LOCAL_MODEL", "ARIA_OLLAMA_URL", "ARIA_LOCAL_TIMEOUT_SECONDS", "ARIA_HISTORY_TURNS"}
+LOCAL_SETTINGS = {"ARIA_LOCAL_MODEL", "ARIA_OLLAMA_URL", "ARIA_LOCAL_TIMEOUT_SECONDS", "ARIA_HISTORY_TURNS", "ARIA_VOSK_MODEL_PATH"}
 
 
 def load_dotenv(path: Path) -> None:

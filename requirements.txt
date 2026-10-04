@@ -1,1 +1,2 @@
-# ARIA v0.1 uses only the Python standard library (Python 3.10+).
+# ARIA text mode uses only the Python standard library (Python 3.10+).
+# For optional offline voice, install requirements-voice.txt.

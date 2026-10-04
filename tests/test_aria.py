@@ -4,30 +4,35 @@ import io
 import json
 import os
 from pathlib import Path
+import sys
 import threading
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from aria.assistant import Assistant
 from aria.backend import BackendError, OllamaBackend
 from aria.cli import main
 from aria.config import Config, ConfigurationError, load_dotenv
+from aria.storage import SessionStore, StorageError
+from aria.voice import LocalVoice, VoiceError
 
 
 class FakeBackend:
     def __init__(self):
         self.calls = []
-        self.fail = False
+        self.fail_after_first_chunk = False
 
-    def complete(self, messages):
+    def stream(self, messages):
         self.calls.append(messages)
-        if self.fail:
+        yield "reply "
+        if self.fail_after_first_chunk:
             raise BackendError("temporary failure")
-        return f"reply {len(self.calls)}"
+        yield str(len(self.calls))
 
 
 class AssistantTests(unittest.TestCase):
-    def test_history_is_bounded_and_resettable(self):
+    def test_context_is_bounded_but_saved_history_is_full(self):
         backend = FakeBackend()
         assistant = Assistant(backend, history_turns=1)
         assistant.ask("first")
@@ -36,17 +41,46 @@ class AssistantTests(unittest.TestCase):
         self.assertEqual([item["role"] for item in backend.calls[2]],
                          ["system", "user", "assistant", "user"])
         self.assertEqual(backend.calls[2][1]["content"], "second")
-        self.assertEqual(len(assistant.history), 2)
+        self.assertEqual(len(assistant.history), 6)
         assistant.reset()
         self.assertEqual(assistant.history, [])
 
-    def test_failed_request_does_not_change_history(self):
+    def test_partial_reply_does_not_change_history(self):
         backend = FakeBackend()
         assistant = Assistant(backend, history_turns=2)
-        backend.fail = True
+        backend.fail_after_first_chunk = True
         with self.assertRaises(BackendError):
-            assistant.ask("try")
+            list(assistant.stream_reply("try"))
         self.assertEqual(assistant.history, [])
+
+
+class StorageTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = Path.cwd() / "tests" / "_aria_test_sessions"
+        self.store = SessionStore(self.directory)
+
+    def tearDown(self):
+        if self.directory.exists():
+            for path in self.directory.iterdir():
+                if path.is_file():
+                    path.unlink()
+            self.directory.rmdir()
+
+    def test_roundtrip_and_names(self):
+        messages = [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}]
+        self.store.save("demo", messages)
+        self.assertEqual(self.store.load("demo"), messages)
+        self.assertEqual(self.store.names(), ["demo"])
+        self.store.save("demo", [])
+        self.assertEqual(self.store.load("demo"), [])
+
+    def test_invalid_names_and_corrupt_history(self):
+        with self.assertRaises(StorageError):
+            self.store.save("../outside", [])
+        self.directory.mkdir(exist_ok=True)
+        (self.directory / "bad.json").write_text('{"messages":[{"role":"system","content":"x"}]}', encoding="utf-8")
+        with self.assertRaises(StorageError):
+            self.store.load("bad")
 
 
 class ConfigTests(unittest.TestCase):
@@ -80,7 +114,11 @@ class ConfigTests(unittest.TestCase):
 class LocalHandler(BaseHTTPRequestHandler):
     requests = []
     post_status = 200
-    body = {"message": {"content": "Hello from fake model"}}
+    chunks = [
+        {"message": {"content": "Hello "}, "done": False},
+        {"message": {"content": "from fake model"}, "done": False},
+        {"message": {"content": ""}, "done": True},
+    ]
     models = [{"name": "test-model"}]
 
     def do_GET(self):
@@ -90,7 +128,15 @@ class LocalHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         size = int(self.headers["Content-Length"])
         self.requests.append(("POST", self.path, dict(self.headers), json.loads(self.rfile.read(size))))
-        self._reply(self.post_status, self.body)
+        if self.post_status != 200:
+            self._reply(self.post_status, {"error": "model unavailable"})
+            return
+        payload = b"".join(json.dumps(chunk).encode("utf-8") + b"\n" for chunk in self.chunks)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def _reply(self, status, body):
         payload = json.dumps(body).encode("utf-8")
@@ -120,16 +166,23 @@ class BackendTests(unittest.TestCase):
     def setUp(self):
         LocalHandler.requests = []
         LocalHandler.post_status = 200
-        LocalHandler.body = {"message": {"content": "Hello from fake model"}}
+        LocalHandler.chunks = [
+            {"message": {"content": "Hello "}, "done": False},
+            {"message": {"content": "from fake model"}, "done": False},
+            {"message": {"content": ""}, "done": True},
+        ]
         LocalHandler.models = [{"name": "test-model"}]
         self.url = f"http://127.0.0.1:{self.server.server_port}"
         self.config = Config("test-model", self.url, 2, 10)
 
-    def test_request_and_cli_once(self):
-        with patch.dict(os.environ, {"ARIA_LOCAL_MODEL": "test-model", "ARIA_OLLAMA_URL": self.url}):
+    def test_stream_request_and_cli_once(self):
+        with patch.dict(os.environ, {"ARIA_LOCAL_MODEL": "test-model", "ARIA_OLLAMA_URL": self.url}), \
+             patch("aria.cli.SessionStore") as store_class:
+            store_class.return_value.load.return_value = []
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 status = main(["--once", "Hi"])
+            store_class.return_value.save.assert_called_once()
         self.assertEqual(status, 0)
         self.assertIn("Hello from fake model", output.getvalue())
         self.assertEqual(LocalHandler.requests[0][0:2], ("GET", "/api/tags"))
@@ -137,19 +190,18 @@ class BackendTests(unittest.TestCase):
         self.assertEqual((method, path), ("POST", "/api/chat"))
         self.assertNotIn("Authorization", headers)
         self.assertEqual(body["model"], "test-model")
-        self.assertFalse(body["stream"])
+        self.assertTrue(body["stream"])
         self.assertEqual(body["messages"][-1], {"role": "user", "content": "Hi"})
         self.assertEqual(body["messages"][0]["role"], "system")
 
-    def test_http_error_and_bad_response(self):
+    def test_http_error_and_incomplete_stream(self):
         backend = OllamaBackend(self.config)
         LocalHandler.post_status = 404
-        LocalHandler.body = {"error": "model unavailable"}
         with self.assertRaisesRegex(BackendError, "HTTP 404.*model unavailable"):
             backend.complete([{"role": "user", "content": "Hi"}])
         LocalHandler.post_status = 200
-        LocalHandler.body = {"message": {}}
-        with self.assertRaisesRegex(BackendError, "no usable text"):
+        LocalHandler.chunks = [{"message": {"content": "partial"}, "done": False}]
+        with self.assertRaisesRegex(BackendError, "before completing"):
             backend.complete([{"role": "user", "content": "Hi"}])
 
     def test_uninstalled_model_is_not_sent_for_inference(self):
@@ -157,6 +209,73 @@ class BackendTests(unittest.TestCase):
         with self.assertRaisesRegex(BackendError, "not installed"):
             OllamaBackend(self.config).complete([{"role": "user", "content": "Hi"}])
         self.assertEqual([item[0] for item in LocalHandler.requests], ["GET"])
+
+
+class CliTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = Path.cwd() / "tests" / "_aria_test_sessions"
+        self.store = SessionStore(self.directory)
+
+    def tearDown(self):
+        if self.directory.exists():
+            for path in self.directory.iterdir():
+                if path.is_file():
+                    path.unlink()
+            self.directory.rmdir()
+
+    def test_interactive_chat_is_saved_and_resumed(self):
+        output = io.StringIO()
+        with patch("aria.cli.SessionStore", return_value=self.store), \
+             patch("aria.cli.OllamaBackend", return_value=FakeBackend()), \
+             patch("builtins.input", side_effect=["hello", "/exit"]), \
+             contextlib.redirect_stdout(output):
+            self.assertEqual(main(["--session", "example"]), 0)
+        self.assertIn("ARIA > reply 1", output.getvalue())
+        self.assertEqual(self.store.load("example"), [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "reply 1"},
+        ])
+        with patch("aria.cli.SessionStore", return_value=self.store), \
+             patch("aria.cli.OllamaBackend", return_value=FakeBackend()), \
+             patch("builtins.input", side_effect=["/exit"]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["--session", "example"]), 0)
+
+
+class VoiceTests(unittest.TestCase):
+    def test_missing_model_has_clear_error(self):
+        with self.assertRaisesRegex(VoiceError, "Vosk speech model not found"):
+            LocalVoice(Path("missing-vosk-model"))
+
+    def test_offline_voice_reads_one_utterance_and_speaks(self):
+        class InputStream:
+            def __init__(self, **kwargs):
+                self.callback = kwargs["callback"]
+
+            def __enter__(self):
+                self.callback(b"audio", 5, None, None)
+                return self
+
+            def __exit__(self, *_args):
+                pass
+
+        recognizer = MagicMock()
+        recognizer.AcceptWaveform.return_value = True
+        recognizer.Result.return_value = '{"text":"hello aria"}'
+        speaker = MagicMock()
+        modules = {
+            "sounddevice": SimpleNamespace(query_devices=lambda **_kwargs: {"default_samplerate": 16000},
+                                           RawInputStream=InputStream),
+            "vosk": SimpleNamespace(Model=lambda _path: object(),
+                                    KaldiRecognizer=lambda _model, _rate: recognizer),
+            "pyttsx3": SimpleNamespace(init=lambda: speaker),
+        }
+        with patch.object(Path, "is_dir", return_value=True), patch.dict(sys.modules, modules):
+            voice = LocalVoice(Path("model"))
+            self.assertEqual(voice.listen(), "hello aria")
+            voice.say("hello back")
+        speaker.say.assert_called_once_with("hello back")
+        speaker.runAndWait.assert_called_once()
 
 
 if __name__ == "__main__":
